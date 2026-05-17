@@ -4,16 +4,26 @@ const BASE = "";
 // Fetched once on first reveal request and cached in memory.
 let _sessionToken: string | null = null;
 
+type TelegramWindow = Window & {
+  Telegram?: {
+    WebApp?: {
+      initData?: string;
+    };
+  };
+};
+
 // Telegram Mini App auth — inject initData header for all requests
 // when running inside a Telegram WebApp context.
 function _tgHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
   try {
-    const tg = (window as any).Telegram?.WebApp;
+    const tg = (window as TelegramWindow).Telegram?.WebApp;
     if (tg?.initData) {
       headers["X-Telegram-Init-Data"] = tg.initData;
     }
-  } catch {}
+  } catch {
+    // Running outside a browser-like Telegram context.
+  }
   return headers;
 }
 
@@ -231,7 +241,7 @@ export const api = {
   // Streaming chat via gateway /v1/chat/completions
   streamChat: async function* (
     messages: { role: string; content: string }[],
-    opts?: { sessionId?: string; onSessionId?: (id: string) => void },
+    opts?: { sessionId?: string; onSessionId?: (id: string) => void; signal?: AbortSignal },
   ): AsyncGenerator<string> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -241,7 +251,9 @@ export const api = {
     try {
       const token = await getSessionToken();
       headers["Authorization"] = `Bearer ${token}`;
-    } catch {}
+    } catch {
+      // Telegram initData auth is still valid when no session token exists.
+    }
     const tg = _tgHeaders();
     Object.assign(headers, tg);
 
@@ -252,6 +264,7 @@ export const api = {
     const res = await fetch("/v1/chat/completions", {
       method: "POST",
       headers,
+      signal: opts?.signal,
       body: JSON.stringify({
         model: "hermes-agent",
         messages,
@@ -297,15 +310,65 @@ export const api = {
         if (!trimmed.startsWith("data: ")) continue;
         const payload = trimmed.slice(6);
         if (payload === "[DONE]") return;
+        let chunk: unknown;
         try {
-          const chunk = JSON.parse(payload);
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) yield delta;
-        } catch {}
+          chunk = JSON.parse(payload) as unknown;
+        } catch {
+          continue;
+        }
+        const error = asRecord(chunk)?.error;
+        if (error) {
+          const errorRecord = asRecord(error);
+          const message = typeof error === "string"
+            ? error
+            : extractContentText(errorRecord?.message) || "Stream error";
+          throw new Error(message);
+        }
+        const delta = extractStreamText(chunk);
+        if (delta) yield delta;
       }
     }
   },
 };
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function extractContentText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+
+  return value
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      const record = part as Record<string, unknown>;
+      return extractContentText(record.text) || extractContentText(record.content);
+    })
+    .join("");
+}
+
+function extractStreamText(chunk: unknown): string {
+  const record = asRecord(chunk);
+  if (!record) return "";
+  const choices = record.choices;
+  const choice = Array.isArray(choices) ? asRecord(choices[0]) : null;
+  const delta = asRecord(choice?.delta);
+  const response = asRecord(record.response);
+
+  return (
+    extractContentText(delta?.content) ||
+    extractContentText(delta?.text) ||
+    extractContentText(asRecord(choice?.message)?.content) ||
+    extractContentText(choice?.text) ||
+    extractContentText(record.delta) ||
+    extractContentText(record.text) ||
+    extractContentText(record.content) ||
+    extractContentText(record.token) ||
+    extractContentText(response?.output_text)
+  );
+}
 
 export interface PlatformStatus {
   error_code?: string;
