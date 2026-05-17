@@ -11,6 +11,10 @@ interface ChatMsg {
   content: string;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
@@ -84,10 +88,10 @@ export default function ChatPage() {
           ...prev,
           { role: "command", content: r.output || "(no output)" },
         ]);
-      } catch (e: any) {
+      } catch (e: unknown) {
         setMessages((prev) => [
           ...prev,
-          { role: "system", content: `Error: ${e.message}` },
+          { role: "system", content: `Error: ${errorMessage(e)}` },
         ]);
       }
       setStreaming(false);
@@ -114,6 +118,7 @@ export default function ChatPage() {
       for await (const delta of api.streamChat(history, {
         sessionId: sessionIdRef.current || undefined,
         onSessionId: (id) => { sessionIdRef.current = id; },
+        signal: controller.signal,
       })) {
         if (controller.signal.aborted) break;
         assistantContent += delta;
@@ -123,17 +128,34 @@ export default function ChatPage() {
           return updated;
         });
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (!controller.signal.aborted) {
         setMessages((prev) => {
           const updated = [...prev];
           updated[updated.length - 1] = {
             role: "system",
-            content: `Error: ${e.message}`,
+            content: `Error: ${errorMessage(e)}`,
           };
           return updated;
         });
       }
+    }
+
+    if (assistantContent.trim().length === 0) {
+      setMessages((prev) => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        if (last?.role !== "assistant" || last.content.trim().length > 0) return prev;
+        if (controller.signal.aborted) {
+          updated.pop();
+        } else {
+          updated[updated.length - 1] = {
+            role: "system",
+            content: "No response from Hermes.",
+          };
+        }
+        return updated;
+      });
     }
 
     abortRef.current = null;
@@ -182,7 +204,10 @@ export default function ChatPage() {
               {msg.role === "assistant" ? (
                 <div className="prose prose-sm dark:prose-invert max-w-none whitespace-pre-wrap break-words">
                   {streaming && i === messages.length - 1 && !msg.content ? (
-                    <DnaLoader />
+                    <div className="flex min-w-32 items-center gap-2 text-sm text-muted-foreground">
+                      <DnaLoader />
+                      <span>Waiting for Hermes...</span>
+                    </div>
                   ) : (
                     <>
                       <Markdown content={msg.content} />
